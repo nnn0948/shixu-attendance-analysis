@@ -11,8 +11,8 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { parseAttendanceSheets, type PunchGroup } from '@/lib/attendance-parser';
 
-type PunchGroup = { name: string; date: string; times: number[] };
 type SegmentResult = { hours: number; valid: boolean; issue?: string };
 type DailyRow = { name: string; date: string; morning: number; afternoon: number; total: number; status: string; type: 'ok' | 'half' | 'warn'; morningTimes: number[]; afternoonTimes: number[]; issues: string[] };
 type SummaryRow = { name: string; days: number; total: number; exceptionDates: string[] };
@@ -75,14 +75,11 @@ export default function Home() {
     try {
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: 'array', cellDates: true });
-      const parsed: PunchGroup[] = [];
-      let rowCount = 0;
-      for (const sheetName of workbook.SheetNames) {
-        const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[sheetName], { defval: '', raw: false, dateNF: 'yyyy-mm-dd hh:mm:ss' });
-        rowCount += rows.length;
-        parsed.push(...parseRows(rows));
-      }
-      const merged = mergeGroups(parsed);
+      const sheets = workbook.SheetNames.map((sheetName) => ({
+        matrix: XLSX.utils.sheet_to_json<unknown[]>(workbook.Sheets[sheetName], { header: 1, defval: '', raw: false, dateNF: 'yyyy-mm-dd hh:mm:ss' }),
+        records: XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[sheetName], { defval: '', raw: false, dateNF: 'yyyy-mm-dd hh:mm:ss' }),
+      }));
+      const { groups: merged, rowCount } = parseAttendanceSheets(sheets);
       if (!merged.length) throw new Error('未识别到“姓名、日期、打卡时间”数据，请检查表头或时间格式。');
       setGroups(merged); setFileName(file.name); setSourceRows(rowCount);
     } catch (cause) {
@@ -206,39 +203,12 @@ function issueRows(rows: DailyRow[]): IssueRow[] {
   return result;
 }
 
-function parseRows(rows: Record<string, unknown>[]): PunchGroup[] {
-  const groups: PunchGroup[] = []; let lastName = ''; let lastDate = '';
-  for (const row of rows) {
-    const entries = Object.entries(row); const nameEntry = entries.find(([key]) => /^(姓名|员工姓名|员工|名字|name|employee)$/i.test(normalizeKey(key))); const dateEntry = entries.find(([key]) => /^(日期|考勤日期|打卡日期|签到日期|date|day)$/i.test(normalizeKey(key)));
-    const currentName = cleanName(nameEntry?.[1]) || lastName; const explicitDate = parseDate(dateEntry?.[1]) || ''; if (currentName) lastName = currentName; if (explicitDate) lastDate = explicitDate; if (!currentName) continue;
-    const byDate = new Map<string, number[]>();
-    for (const [key, value] of entries) { if (key === nameEntry?.[0]) continue; const text = String(value ?? '').trim(); if (!text) continue; const date = parseDate(value) || explicitDate || lastDate; const times = extractTimes(value); const isPunchField = /(打卡|签到|签退|时间|上班|下班|上午|下午|punch|clock|check|time)/i.test(key); if (date && times.length && (isPunchField || key === dateEntry?.[0] || /\d{1,2}:\d{2}/.test(text))) byDate.set(date, [...(byDate.get(date) ?? []), ...times]); }
-    for (const [date, times] of byDate) if (times.length) groups.push({ name: currentName, date, times });
-  }
-  return groups;
-}
-
 function mergeGroups(groups: PunchGroup[]): PunchGroup[] {
   const map = new Map<string, PunchGroup>();
   for (const group of groups) { if (!group.name || !group.date || !group.times.length) continue; const key = `${group.name}\u0000${group.date}`; const item = map.get(key) ?? { name: group.name, date: group.date, times: [] }; item.times.push(...group.times); item.times = [...new Set(item.times)].sort((a, b) => a - b); map.set(key, item); }
   return [...map.values()];
 }
 
-function extractTimes(value: unknown): number[] {
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return [value.getHours() * 60 + value.getMinutes()];
-  const text = String(value ?? ''); const result: number[] = []; const regex = /(?:^|\D)([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?=$|\D)/g; let match: RegExpExecArray | null;
-  while ((match = regex.exec(text))) result.push(Number(match[1]) * 60 + Number(match[2]));
-  return result;
-}
-
-function parseDate(value: unknown): string | null {
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return localDate(value);
-  const text = String(value ?? '').trim(); if (!text) return null; const match = text.match(/(20\d{2})[年\/-](\d{1,2})[月\/-](\d{1,2})日?/); if (match) return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`; const parsed = new Date(text); return Number.isNaN(parsed.getTime()) ? null : localDate(parsed);
-}
-
-function localDate(date: Date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; }
-function cleanName(value: unknown) { const text = String(value ?? '').trim(); return text && !/姓名|员工姓名/i.test(text) ? text : ''; }
-function normalizeKey(value: string) { return value.replace(/[\s_\-（）()]/g, '').toLowerCase(); }
 function timeToMinutes(value: string) { const match = value.match(/^(\d{1,2}):([0-5]\d)$/); if (!match || Number(match[1]) > 23) return null; return Number(match[1]) * 60 + Number(match[2]); }
 function formatTime(value: number) { return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`; }
 function formatMonth(value?: string) { if (!value) return ''; const [year, month] = value.split('-'); return `${year} 年 ${Number(month)} 月考勤`; }
