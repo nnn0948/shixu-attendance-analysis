@@ -12,8 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { parseAttendanceSheets, type PunchGroup } from '@/lib/attendance-parser';
+import { analyzePeriods, DEFAULT_BOUNDARY, DEFAULT_BOUNDARY_MINUTES } from '@/lib/attendance-calculation';
 
-type SegmentResult = { hours: number; valid: boolean; issue?: string };
 type DailyRow = { name: string; date: string; morning: number; afternoon: number; total: number; status: string; type: 'ok' | 'half' | 'warn'; morningTimes: number[]; afternoonTimes: number[]; issues: string[] };
 type SummaryRow = { name: string; days: number; total: number; exceptionDates: string[] };
 type IssueRow = { name: string; date: string; period: string; punches: string; reason: string };
@@ -32,14 +32,14 @@ export default function Home() {
   const [groups, setGroups] = useState<PunchGroup[]>(sampleGroups);
   const [fileName, setFileName] = useState('示例考勤数据');
   const [sourceRows, setSourceRows] = useState(24);
-  const [boundary, setBoundary] = useState('12:30');
+  const [boundary, setBoundary] = useState(DEFAULT_BOUNDARY);
   const [duplicateWindow, setDuplicateWindow] = useState(10);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [error, setError] = useState('');
   const [dragging, setDragging] = useState(false);
 
-  const boundaryMinutes = timeToMinutes(boundary) ?? 750;
+  const boundaryMinutes = timeToMinutes(boundary) ?? DEFAULT_BOUNDARY_MINUTES;
   const daily = useMemo(() => analyzeGroups(groups, boundaryMinutes, duplicateWindow), [groups, boundaryMinutes, duplicateWindow]);
   const summaries = useMemo(() => summarize(daily), [daily]);
   const issues = useMemo(() => issueRows(daily), [daily]);
@@ -137,7 +137,7 @@ export default function Home() {
           <TabsContent value="summary" className="tab-content"><SummaryTable rows={visibleSummaries} /></TabsContent>
           <TabsContent value="issues" className="tab-content"><IssueTable rows={visibleIssues} /></TabsContent>
         </Tabs>
-        <div className="logic-note"><Info size={16} /><span>计算口径：以 <strong>{boundary}</strong> 划分上午与下午；单次打卡不计时，{duplicateWindow} 分钟内的重复记录自动去重。</span></div>
+        <div className="logic-note"><Info size={16} /><span>计算口径：<strong>{boundary}</strong> 前为上午，起为下午；半天内按顺序两两配对后累加。每半天超出半小时档位的部分 ≤15 分钟舍去，超过 15 分钟保留实际时长；未配对打卡不计时并标记异常。</span></div>
       </section>
     </main>
   );
@@ -145,7 +145,13 @@ export default function Home() {
 
 function RuleDialog({ boundary, setBoundary, duplicateWindow, setDuplicateWindow }: { boundary: string; setBoundary: (value: string) => void; duplicateWindow: number; setDuplicateWindow: (value: number) => void }) {
   const [nextBoundary, setNextBoundary] = useState(boundary); const [nextWindow, setNextWindow] = useState(String(duplicateWindow));
-  return <Dialog><DialogTrigger render={<Button variant="ghost" size="sm" className="rule-button" />}><Settings2 size={16} />计算规则</DialogTrigger><DialogContent className="rule-dialog"><DialogHeader><DialogTitle>计算规则</DialogTitle><DialogDescription>调整后将立即重新计算当前考勤结果。</DialogDescription></DialogHeader><div className="rule-fields"><div><Label htmlFor="boundary">上午 / 下午分界</Label><Input id="boundary" type="time" value={nextBoundary} onChange={(event) => setNextBoundary(event.target.value)} /></div><div><Label htmlFor="duplicate">重复打卡识别窗口（分钟）</Label><Input id="duplicate" type="number" min="1" max="60" value={nextWindow} onChange={(event) => setNextWindow(event.target.value)} /></div><div className="rule-summary"><CheckCircle2 size={17} /><span>每个时段 2 次打卡正常计算；1 次打卡记为 0 并报错；多次打卡先按识别窗口去重，无法确定时进入异常清单。</span></div></div><DialogFooter><Button onClick={() => { if (timeToMinutes(nextBoundary) !== null) setBoundary(nextBoundary); setDuplicateWindow(Math.min(60, Math.max(1, Number(nextWindow) || 10))); }}>应用规则</Button></DialogFooter></DialogContent></Dialog>;
+  return <Dialog><DialogTrigger render={<Button variant="ghost" size="sm" className="rule-button" />}><Settings2 size={16} />计算规则</DialogTrigger><DialogContent className="rule-dialog"><DialogHeader><DialogTitle>计算规则</DialogTitle><DialogDescription>应用后将重新计算每日明细、月度汇总和导出结果。</DialogDescription></DialogHeader><div className="rule-fields">
+    <div><Label htmlFor="boundary">上午 / 下午分界（默认 12:10）</Label><Input id="boundary" type="time" value={nextBoundary} onChange={(event) => setNextBoundary(event.target.value)} /></div>
+    <div><Label htmlFor="duplicate">奇数次打卡的重复识别窗口（分钟）</Label><Input id="duplicate" type="number" min="1" max="60" value={nextWindow} onChange={(event) => setNextWindow(event.target.value)} /></div>
+    <div className="rule-summary"><CheckCircle2 size={17} /><span>分界时刻之前为上午，从分界时刻起为下午。半天内按时间排序，第 1–2 次、第 3–4 次依次配对并累加，中间离岗时间不计入。</span></div>
+    <div className="rule-summary"><CheckCircle2 size={17} /><span>每半天合计后，超出半小时档位的部分不超过 15 分钟则舍去；超过 15 分钟保留实际时长。例如 4小时40分 → 4小时30分，4小时46分保持不变。</span></div>
+    <div className="rule-summary"><Info size={17} /><span>偶数次打卡直接配对，不合并短暂离岗。奇数次仅在记录可归为上班、下班两组时按窗口去重并提示；其他情况计算完整配对，剩余单次不计时并标记缺卡。</span></div>
+  </div><DialogFooter><Button onClick={() => { if (timeToMinutes(nextBoundary) !== null) setBoundary(nextBoundary); setDuplicateWindow(Math.min(60, Math.max(1, Number(nextWindow) || 10))); }}>应用规则</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function Metric({ icon, label, value, unit, note, tone }: { icon: React.ReactNode; label: string; value: string; unit?: string; note: string; tone: string }) { return <article className="metric-card"><div className={`metric-icon ${tone}`}>{icon}</div><div><p>{label}</p><div className="metric-value">{value}{unit && <small>{unit}</small>}</div><span>{note}</span></div></article>; }
@@ -170,25 +176,12 @@ function EmptyTable() { return <div className="empty-view"><Search size={30} /><
 
 function analyzeGroups(groups: PunchGroup[], boundary: number, duplicateWindow: number): DailyRow[] {
   return mergeGroups(groups).map((group) => {
-    const morningTimes = group.times.filter((time) => time < boundary); const afternoonTimes = group.times.filter((time) => time >= boundary);
-    const morning = analyzeSegment(morningTimes, '上午', duplicateWindow); const afternoon = analyzeSegment(afternoonTimes, '下午', duplicateWindow);
+    const { morningTimes, afternoonTimes, morning, afternoon } = analyzePeriods(group.times, boundary, duplicateWindow);
     const issues = [morning.issue, afternoon.issue].filter(Boolean) as string[]; const total = round2(morning.hours + afternoon.hours);
     let status = '正常'; let type: DailyRow['type'] = 'ok';
     if (issues.length) { status = issues.join('；'); type = 'warn'; } else if ((morning.valid && !afternoon.valid) || (!morning.valid && afternoon.valid)) { status = '工作半天'; type = 'half'; } else if (!morning.valid && !afternoon.valid) { status = '无有效工时'; type = 'warn'; }
     return { name: group.name, date: group.date, morning: round2(morning.hours), afternoon: round2(afternoon.hours), total, status, type, morningTimes, afternoonTimes, issues };
   }).sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, 'zh-CN'));
-}
-
-function analyzeSegment(times: number[], label: string, window: number): SegmentResult {
-  const sorted = [...new Set(times)].sort((a, b) => a - b);
-  if (!sorted.length) return { hours: 0, valid: false };
-  if (sorted.length === 1) return { hours: 0, valid: false, issue: `${label}仅有 1 次打卡，缺少对应签到` };
-  if (sorted.length === 2) return { hours: Math.max(0, (sorted[1] - sorted[0]) / 60), valid: true };
-  const clusters: number[][] = [];
-  for (const time of sorted) { const last = clusters.at(-1); if (last && time - last.at(-1)! <= window) last.push(time); else clusters.push([time]); }
-  const records = sorted.map(formatTime).join('、');
-  if (clusters.length === 2) { const start = clusters[0].at(-1)!; const end = clusters[1][0]; return { hours: Math.max(0, (end - start) / 60), valid: true, issue: `${label}出现 ${sorted.length} 次打卡，已忽略重复记录并取 ${formatTime(start)}–${formatTime(end)}；原记录：${records}` }; }
-  return { hours: 0, valid: false, issue: `${label}无法确定有效打卡区间，未计入工时；原记录：${records}` };
 }
 
 function summarize(rows: DailyRow[]): SummaryRow[] {
