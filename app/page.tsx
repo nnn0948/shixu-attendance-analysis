@@ -13,10 +13,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { parseAttendanceSheets, type PunchGroup } from '@/lib/attendance-parser';
 import { analyzePeriods, DEFAULT_BOUNDARY, DEFAULT_BOUNDARY_MINUTES } from '@/lib/attendance-calculation';
-import { formatWorkDays, groupIssuesByEmployee, type IssueRow } from '@/lib/attendance-report';
+import { summarizeMonthly, monthlyWorkDays, groupIssuesByEmployee, type SummaryRow, type IssueRow } from '@/lib/attendance-report';
 
 type DailyRow = { name: string; date: string; morning: number; afternoon: number; total: number; status: string; type: 'ok' | 'half' | 'warn'; morningTimes: number[]; afternoonTimes: number[]; issues: string[] };
-type SummaryRow = { name: string; days: number; total: number; exceptionDates: string[] };
 
 const sampleGroups: PunchGroup[] = [
   { name: '林晓雯', date: '2026-08-03', times: [485, 720, 810, 1065] },
@@ -41,16 +40,17 @@ export default function Home() {
 
   const boundaryMinutes = timeToMinutes(boundary) ?? DEFAULT_BOUNDARY_MINUTES;
   const daily = useMemo(() => analyzeGroups(groups, boundaryMinutes, duplicateWindow), [groups, boundaryMinutes, duplicateWindow]);
-  const summaries = useMemo(() => summarize(daily), [daily]);
+  const summaries = useMemo(() => summarizeMonthly(daily), [daily]);
   const issues = useMemo(() => issueRows(daily), [daily]);
   const visibleDaily = daily.filter((row) => matches(row.name, row.date, query) && (filter === 'all' || (filter === 'normal' ? row.type === 'ok' : filter === 'half' ? row.type === 'half' : row.type === 'warn')));
-  const visibleSummaries = summaries.filter((row) => matches(row.name, '', query));
+  const visibleSummaries = summaries.filter((row) => matches(row.name, row.month, query));
   const visibleIssues = issues.filter((row) => matches(row.name, row.date, query));
   const totalHours = summaries.reduce((sum, row) => sum + row.total, 0);
-  const employeeCount = summaries.length;
+  const employeeCount = new Set(summaries.map((row) => row.name)).size;
   const attendanceDays = daily.filter((row) => row.total > 0).length;
   const completeness = daily.length ? Math.max(0, 100 - (issues.length / daily.length) * 100) : 0;
-  const monthLabel = formatMonth(daily[0]?.date);
+  const months = [...new Set(daily.map((row) => row.date.slice(0, 7)))];
+  const monthLabel = months.length > 1 ? `${months.length}个月考勤 · 按月分别核算` : formatMonth(daily[0]?.date);
   const stateRef = useRef({ daily, summaries, issues });
   stateRef.current = { daily, summaries, issues };
 
@@ -64,7 +64,7 @@ export default function Home() {
       description: '读取当前页面已经完成的考勤汇总和异常数量。',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      execute: () => ({ employees: stateRef.current.summaries.length, attendanceDays: stateRef.current.daily.filter((row) => row.total > 0).length, totalHours: round2(stateRef.current.summaries.reduce((sum, row) => sum + row.total, 0)), exceptionItems: stateRef.current.issues.length }),
+      execute: () => ({ employees: new Set(stateRef.current.summaries.map((row) => row.name)).size, attendanceDays: stateRef.current.daily.filter((row) => row.total > 0).length, totalHours: round2(stateRef.current.summaries.reduce((sum, row) => sum + row.total, 0)), exceptionItems: stateRef.current.issues.length }),
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
   }, []);
@@ -89,13 +89,13 @@ export default function Home() {
 
   function exportResults() {
     const detailData = daily.map((row) => ({ 姓名: row.name, 日期: row.date, '上午时长(小时)': row.morning, '下午时长(小时)': row.afternoon, '当天总时长(小时)': row.total, '状态/异常说明': row.status }));
-    const summaryData = summaries.map((row) => ({ 姓名: row.name, 本月出勤天数: row.days, 本月工作天数: formatWorkDays(row.total), '本月总工作时长(小时)': row.total, 异常天数汇总: row.exceptionDates.join('、') || '无' }));
+    const summaryData = summaries.map((row) => ({ 姓名: row.name, 月份: row.month, 本月出勤天数: row.days, 本月工作天数: monthlyWorkDays(row), '全天标准(小时)': row.standard.hours ?? '待确认', '半天标准(小时)': row.standard.hours === null ? '待确认' : row.standard.hours / 2, 标准判定说明: row.standard.explanation, '本月总工作时长(小时)': row.total, 异常天数汇总: row.exceptionDates.join('、') || '无' }));
     const issueData = issues.map((row) => ({ 姓名: row.name, 日期: row.date, 时间段: row.period, 打卡记录: row.punches, 异常原因: row.reason }));
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(detailData), '每日考勤明细');
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summaryData), '月度考勤汇总');
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(issueData), '异常与待确认事项');
-    XLSX.writeFile(workbook, `考勤分析结果_${daily[0]?.date.slice(0, 7) || '本月'}.xlsx`);
+    XLSX.writeFile(workbook, `考勤分析结果_${months.length > 1 ? `${months[0]}至${months.at(-1)}` : months[0] || '本月'}.xlsx`);
   }
 
   function onDrop(event: DragEvent) { event.preventDefault(); setDragging(false); void handleFile(event.dataTransfer.files?.[0]); }
@@ -163,7 +163,23 @@ function DailyTable({ rows }: { rows: DailyRow[] }) {
 
 function SummaryTable({ rows }: { rows: SummaryRow[] }) {
   if (!rows.length) return <EmptyTable />;
-  return <><p className="px-5 py-3 text-sm text-muted-foreground">本月工作天数按累计工时折算：9小时为1天，4.5小时为半天，不足半天的余数按小时显示。本月出勤天数仍按有有效工时的日期统计。</p><div className="table-scroll"><Table><TableHeader><TableRow><TableHead>姓名</TableHead><TableHead className="text-right">本月出勤天数</TableHead><TableHead className="text-right">本月工作天数</TableHead><TableHead className="text-right">本月总工作时长</TableHead><TableHead>异常天数汇总</TableHead></TableRow></TableHeader><TableBody>{rows.map((row) => <TableRow key={row.name}><TableCell className="employee"><span>{row.name.slice(0, 1)}</span>{row.name}</TableCell><TableCell className="hours total">{row.days}<small> 天</small></TableCell><TableCell className="hours total whitespace-nowrap">{formatWorkDays(row.total)}</TableCell><Hours value={row.total} total /><TableCell>{row.exceptionDates.length ? <div className="date-badges">{row.exceptionDates.map((date) => <Badge key={date} className="status warn">{date}</Badge>)}</div> : <span className="no-issue"><CheckCircle2 size={15} />无异常</span>}</TableCell></TableRow>)}</TableBody></Table></div></>;
+  const standards = [...new Map(rows.map((row) => [row.month, row.standard])).values()];
+  return <>
+    <div className="space-y-3 px-5 py-3 text-sm">
+      <p className="text-muted-foreground">从每位员工完整、无异常工作日中识别常见时长，按半小时档位归类，再采用超过半数员工一致的标准。每位员工一票；半天为全天标准的一半，不足半天的余数按小时显示。</p>
+      {standards.map((standard) => <div key={standard.month} className="rounded-lg border p-3">
+        <strong>{standard.month} · {standard.hours === null ? '全天标准待确认' : `全天 ${standard.hours}小时 / 半天 ${standard.hours / 2}小时`}</strong>
+        <p className="mt-1 text-muted-foreground">{standard.explanation}</p>
+      </div>)}
+    </div>
+    <div className="table-scroll"><Table><TableHeader><TableRow>
+      <TableHead>姓名</TableHead><TableHead>月份</TableHead><TableHead className="text-right">本月出勤天数</TableHead><TableHead className="text-right">本月工作天数</TableHead><TableHead className="text-right">本月总工作时长</TableHead><TableHead>异常天数汇总</TableHead>
+    </TableRow></TableHeader><TableBody>{rows.map((row) => <TableRow key={`${row.month}-${row.name}`}>
+      <TableCell className="employee"><span>{row.name.slice(0, 1)}</span>{row.name}</TableCell><TableCell className="date-cell">{row.month}</TableCell>
+      <TableCell className="hours total">{row.days}<small> 天</small></TableCell><TableCell className="hours total whitespace-nowrap">{monthlyWorkDays(row)}</TableCell><Hours value={row.total} total />
+      <TableCell>{row.exceptionDates.length ? <div className="date-badges">{row.exceptionDates.map((date) => <Badge key={date} className="status warn">{date}</Badge>)}</div> : <span className="no-issue"><CheckCircle2 size={15} />无异常</span>}</TableCell>
+    </TableRow>)}</TableBody></Table></div>
+  </>;
 }
 
 function IssueTable({ rows }: { rows: IssueRow[] }) {
@@ -185,12 +201,6 @@ function analyzeGroups(groups: PunchGroup[], boundary: number, duplicateWindow: 
     if (issues.length) { status = issues.join('；'); type = 'warn'; } else if ((morning.valid && !afternoon.valid) || (!morning.valid && afternoon.valid)) { status = '工作半天'; type = 'half'; } else if (!morning.valid && !afternoon.valid) { status = '无有效工时'; type = 'warn'; }
     return { name: group.name, date: group.date, morning: round2(morning.hours), afternoon: round2(afternoon.hours), total, status, type, morningTimes, afternoonTimes, issues };
   }).sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name, 'zh-CN'));
-}
-
-function summarize(rows: DailyRow[]): SummaryRow[] {
-  const map = new Map<string, SummaryRow>();
-  for (const row of rows) { const item = map.get(row.name) ?? { name: row.name, days: 0, total: 0, exceptionDates: [] }; if (row.total > 0) item.days += 1; item.total = round2(item.total + row.total); if (row.issues.length || row.type === 'warn') item.exceptionDates.push(row.date); map.set(row.name, item); }
-  return [...map.values()].map((row) => ({ ...row, exceptionDates: [...new Set(row.exceptionDates)] })).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
 }
 
 function issueRows(rows: DailyRow[]): IssueRow[] {
