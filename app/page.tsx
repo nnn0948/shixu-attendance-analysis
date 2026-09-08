@@ -13,10 +13,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { parseAttendanceSheets, type PunchGroup } from '@/lib/attendance-parser';
 import { analyzePeriods, DEFAULT_BOUNDARY, DEFAULT_BOUNDARY_MINUTES } from '@/lib/attendance-calculation';
+import { formatWorkDays, groupIssuesByEmployee, type IssueRow } from '@/lib/attendance-report';
 
 type DailyRow = { name: string; date: string; morning: number; afternoon: number; total: number; status: string; type: 'ok' | 'half' | 'warn'; morningTimes: number[]; afternoonTimes: number[]; issues: string[] };
 type SummaryRow = { name: string; days: number; total: number; exceptionDates: string[] };
-type IssueRow = { name: string; date: string; period: string; punches: string; reason: string };
 
 const sampleGroups: PunchGroup[] = [
   { name: '林晓雯', date: '2026-08-03', times: [485, 720, 810, 1065] },
@@ -89,7 +89,7 @@ export default function Home() {
 
   function exportResults() {
     const detailData = daily.map((row) => ({ 姓名: row.name, 日期: row.date, '上午时长(小时)': row.morning, '下午时长(小时)': row.afternoon, '当天总时长(小时)': row.total, '状态/异常说明': row.status }));
-    const summaryData = summaries.map((row) => ({ 姓名: row.name, 本月出勤天数: row.days, '本月总工作时长(小时)': row.total, 异常天数汇总: row.exceptionDates.join('、') || '无' }));
+    const summaryData = summaries.map((row) => ({ 姓名: row.name, 本月出勤天数: row.days, 本月工作天数: formatWorkDays(row.total), '本月总工作时长(小时)': row.total, 异常天数汇总: row.exceptionDates.join('、') || '无' }));
     const issueData = issues.map((row) => ({ 姓名: row.name, 日期: row.date, 时间段: row.period, 打卡记录: row.punches, 异常原因: row.reason }));
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(detailData), '每日考勤明细');
@@ -163,12 +163,15 @@ function DailyTable({ rows }: { rows: DailyRow[] }) {
 
 function SummaryTable({ rows }: { rows: SummaryRow[] }) {
   if (!rows.length) return <EmptyTable />;
-  return <div className="table-scroll"><Table><TableHeader><TableRow><TableHead>姓名</TableHead><TableHead className="text-right">本月出勤天数</TableHead><TableHead className="text-right">本月总工作时长</TableHead><TableHead>异常天数汇总</TableHead></TableRow></TableHeader><TableBody>{rows.map((row) => <TableRow key={row.name}><TableCell className="employee"><span>{row.name.slice(0, 1)}</span>{row.name}</TableCell><TableCell className="hours total">{row.days}<small> 天</small></TableCell><Hours value={row.total} total /><TableCell>{row.exceptionDates.length ? <div className="date-badges">{row.exceptionDates.map((date) => <Badge key={date} className="status warn">{date}</Badge>)}</div> : <span className="no-issue"><CheckCircle2 size={15} />无异常</span>}</TableCell></TableRow>)}</TableBody></Table></div>;
+  return <><p className="px-5 py-3 text-sm text-muted-foreground">本月工作天数按累计工时折算：9小时为1天，4.5小时为半天，不足半天的余数按小时显示。本月出勤天数仍按有有效工时的日期统计。</p><div className="table-scroll"><Table><TableHeader><TableRow><TableHead>姓名</TableHead><TableHead className="text-right">本月出勤天数</TableHead><TableHead className="text-right">本月工作天数</TableHead><TableHead className="text-right">本月总工作时长</TableHead><TableHead>异常天数汇总</TableHead></TableRow></TableHeader><TableBody>{rows.map((row) => <TableRow key={row.name}><TableCell className="employee"><span>{row.name.slice(0, 1)}</span>{row.name}</TableCell><TableCell className="hours total">{row.days}<small> 天</small></TableCell><TableCell className="hours total whitespace-nowrap">{formatWorkDays(row.total)}</TableCell><Hours value={row.total} total /><TableCell>{row.exceptionDates.length ? <div className="date-badges">{row.exceptionDates.map((date) => <Badge key={date} className="status warn">{date}</Badge>)}</div> : <span className="no-issue"><CheckCircle2 size={15} />无异常</span>}</TableCell></TableRow>)}</TableBody></Table></div></>;
 }
 
 function IssueTable({ rows }: { rows: IssueRow[] }) {
   if (!rows.length) return <div className="all-clear"><CheckCircle2 size={34} /><strong>没有待处理异常</strong><span>当前筛选范围内的打卡记录均可正常计算。</span></div>;
-  return <div className="table-scroll"><Table><TableHeader><TableRow><TableHead>员工 / 日期</TableHead><TableHead>时间段</TableHead><TableHead>原始打卡记录</TableHead><TableHead>异常原因与处理结果</TableHead></TableRow></TableHeader><TableBody>{rows.map((row, index) => <TableRow key={`${row.name}-${row.date}-${index}`}><TableCell><div className="issue-person"><strong>{row.name}</strong><span>{row.date}</span></div></TableCell><TableCell><Badge className="period-badge">{row.period}</Badge></TableCell><TableCell className="punches">{row.punches || '无'}</TableCell><TableCell className="reason"><AlertTriangle size={15} />{row.reason}</TableCell></TableRow>)}</TableBody></Table></div>;
+  return <div className="table-scroll"><Table><TableHeader><TableRow><TableHead>日期</TableHead><TableHead>时间段</TableHead><TableHead>原始打卡记录</TableHead><TableHead>异常原因与处理结果</TableHead></TableRow></TableHeader>{groupIssuesByEmployee(rows).map((group) => <TableBody key={group.name} aria-label={`${group.name}的异常事项`}>
+    <TableRow><TableCell colSpan={4} className="bg-muted/40 py-3"><strong>{group.name}</strong><span className="ml-3 text-sm text-muted-foreground">{group.rows.length}项异常 · 涉及{new Set(group.rows.map((row) => row.date)).size}天</span></TableCell></TableRow>
+    {group.rows.map((row, index) => <TableRow key={`${row.date}-${index}`}><TableCell className="date-cell">{row.date}</TableCell><TableCell><Badge className="period-badge">{row.period}</Badge></TableCell><TableCell className="punches">{row.punches || '无'}</TableCell><TableCell className="reason"><AlertTriangle size={15} />{row.reason}</TableCell></TableRow>)}
+  </TableBody>)}</Table></div>;
 }
 
 function Hours({ value, total }: { value: number; total?: boolean }) { return <TableCell className={`hours ${total ? 'total' : ''}`}>{value.toFixed(2)}<small> h</small></TableCell>; }
@@ -193,7 +196,7 @@ function summarize(rows: DailyRow[]): SummaryRow[] {
 function issueRows(rows: DailyRow[]): IssueRow[] {
   const result: IssueRow[] = [];
   for (const row of rows) { if (!row.issues.length && row.type === 'warn') result.push({ name: row.name, date: row.date, period: '全天', punches: [...row.morningTimes, ...row.afternoonTimes].map(formatTime).join('、'), reason: row.status }); for (const reason of row.issues) { const period = reason.startsWith('上午') ? '上午' : '下午'; const times = period === '上午' ? row.morningTimes : row.afternoonTimes; result.push({ name: row.name, date: row.date, period, punches: times.map(formatTime).join('、'), reason }); } }
-  return result;
+  return groupIssuesByEmployee(result).flatMap((group) => group.rows);
 }
 
 function mergeGroups(groups: PunchGroup[]): PunchGroup[] {
